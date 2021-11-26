@@ -1,32 +1,50 @@
 #! /usr/bin/env python
 
 import asyncio
+import json
 import secrets
 import websockets
 
+from asyncio.base_events import Server
 from enum import Enum, auto
 
-class Pokemon(object):
+class Pokemon(dict):
     def __init__(self, paste):
         species_line = paste.split('\n')[0]
         if '(' in species_line:
-            self.species = species_line[species_line.find("(")+1:species_line.find(")")]
+            species = species_line[species_line.find("(")+1:species_line.find(")")].strip()
         else:
-            self.species = species_line.split('@')[0]
-        self.paste = paste
+            species = species_line.split('@')[0].strip()
+        dict.__init__(self, species=species, paste=paste)
 
-class TeamName(Enum):
-    TEAM1 = auto()
-    TEAM2 = auto()
+    def species_only(self):
+        return { "species": self['species'] }
 
-class Team(object):
+class TeamName():
+    TEAM1 = "TEAM1"
+    TEAM2 = "TEAM2"
+
+def other_team(team):
+    match team:
+        case TeamName.TEAM1:
+            return TeamName.TEAM2
+        case TeamName.TEAM2:
+            return TeamName.TEAM1
+
+class Box(object):
     def __init__(self, box_paste):
         self.box = []
-        for paste in box_paste.split('\n\n\n'):
+        for paste in box_paste.strip().split('\n\n'):
             self.box.append(Pokemon(paste))
         self.game_score = 0
         self.banned = set()
         self.selected = set()
+
+    def full_box(self):
+        return self.box
+
+    def species_only_box(self):
+        return [pokemon.species_only() for pokemon in self.box]
 
     def game_score(self):
         return self.game_score
@@ -117,37 +135,142 @@ class Game(object):
             case TeamName.TEAM2:
                 self.team2_choices = choices
 
+class ClientMesssageType():
+    NEW_MATCH = "new_match"
+    JOIN_MATCH = "join_match"
+    JOIN_TEAM = "join_team"
+    UPDATE_BOX = "update_box"
+
+class ServerMessageType():
+    JOINED_MATCH = "joined_match"
+    JOINED_TEAM = "joined_team"
+    TEAM_PLAYER_UPDATE = "team_player_update"
+    TEAM_BOX_UPDATE = "team_box_update"
+
 class Match(object):
     def __init__(self, id):
         self.id = id
-        self.team1 = None
-        self.team2 = None
+        self.team1_connected = set()
+        self.team2_connected = set()
+        self.connected = set()
+        self.team1_players = []
+        self.team2_players = []
+        self.box1 = None
+        self.box2 = None
         self.current_game = None
 
     def on_box_paste(self, team, box_paste):
+        box = Box(box_paste)
+        full_box_event = {
+            "type": ServerMessageType.TEAM_BOX_UPDATE,
+            "team": team,
+            "box": box.full_box()
+        }
+        species_only_box_event = {
+            "type": ServerMessageType.TEAM_BOX_UPDATE,
+            "team": team,
+            "box": box.species_only_box()
+        }
         match team:
             case TeamName.TEAM1:
-                self.team1 = Team(box_paste)
+                self.team1 = box
+                websockets.broadcast(self.team1_connected, json.dumps(full_box_event))
+                websockets.broadcast(self.team2_connected, json.dumps(species_only_box_event))
             case TeamName.TEAM2:
-                self.team2 = Team(box_paste)
+                self.team2 = box
+                websockets.broadcast(self.team2_connected, json.dumps(full_box_event))
+                websockets.broadcast(self.team1_connected, json.dumps(species_only_box_event))
         
     def start_game(self):
         self.current_game = Game(self.team1, self.team2)
 
     def ready_to_start_game(self):
         if self.current_game is None:
-            return self.team1 is not None and self.team2 is not None
+            return self.box1 is not None and self.box2 is not None
         else:
             return self.current_game.state == GameState.LOCKED_IN
 
-async def handler(websocket):
+    def add_to_team(self, team, name, websocket):
+        match team:
+            case TeamName.TEAM1:
+                self.team1_players.append(name)
+                self.team1_connected.add(websocket)
+                players = self.team1_players
+            case TeamName.TEAM2:
+                self.team2_players.append(name)
+                self.team2_connected.add(websocket)
+                players = self.team2_players
+        self.connected.add(websocket) 
+        team_player_event = {
+            "type": ServerMessageType.TEAM_PLAYER_UPDATE,
+            "team": team,
+            "players": players
+        }
+        websockets.broadcast(self.connected, json.dumps(team_player_event))
+
+MATCHES = {}
+
+async def play(match, team, websocket):
     async for message in websocket:
-        print(message)
+        event = json.loads(message)
+        match event["type"]:
+            case ClientMesssageType.UPDATE_BOX:
+                match.on_box_paste(team, event["box_paste"])
+
+async def join_match(id, websocket):
+    match = MATCHES[id]
+
+    try:
+        joined_match_event = {
+            "type": ServerMessageType.JOINED_MATCH,
+            "id": id,
+            "team1_players": match.team1_players,
+            "team2_players": match.team2_players
+        }
+        await websocket.send(json.dumps(joined_match_event))
+
+        join_team_message = await websocket.recv()
+        join_team_event = json.loads(join_team_message)
+        assert join_team_event["type"] == ClientMesssageType.JOIN_TEAM
+        team = join_team_event["team"]
+        name = join_team_event["name"]
+        match.add_to_team(team, name, websocket)
+        joined_team_event = {
+            "type": ServerMessageType.JOINED_TEAM,
+            "team": team
+        }
+        await websocket.send(json.dumps(joined_team_event))
+
+        await play(match, team, websocket)
+
+    finally:
+        pass
+
+async def new_match(websocket):
+    id = secrets.token_urlsafe(8)
+    match = Match(id)
+    MATCHES[id] = match
+
+    try:
+        await join_match(id, websocket)
+    finally:
+        pass
+
+async def handler(websocket):
+    message = await websocket.recv()
+    event = json.loads(message)
+    match event["type"]:
+        case ClientMesssageType.NEW_MATCH:
+            await new_match(websocket)
+        case ClientMesssageType.JOIN_MATCH:
+            id = event["id"]
+            await join_match(id, websocket)
+        case unexpected:
+            print(event)
 
 async def main():
     async with websockets.serve(handler, "", 8001):
         await asyncio.Future()  # run forever
-
 
 if __name__ == "__main__":
     asyncio.run(main())
